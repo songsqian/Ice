@@ -1,0 +1,442 @@
+---
+title: "Ice cover BHM"
+output: pdf_document
+date: "2024-07-19"
+---
+
+This file contains the code for the smoothed hockey stick BHM for Great Lakes ice cover
+```{r, include = FALSE}
+packages<-function(x, repos="http://cran.r-project.org", ...){
+  x<-as.character(match.call()[[2]])
+  if (!require(x,character.only=TRUE)){
+    install.packages(pkgs=x, repos=repos, ...)
+    require(x,character.only=TRUE)
+  }
+}
+
+packages(tidyverse)
+packages(tikzDevice)
+packages(reshape())
+packages(rv)
+packages(rstan)
+packages(readxl)
+packages(arm)
+packages(qgam) # for log1pexp
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = min(c(parallel::detectCores(), 8)))
+
+nchains <- min(c(parallel::detectCores(), 8))
+niters <- 10000
+nkeep <- 2500
+nthin <- ceiling((niters/2)*nchains/nkeep)
+```
+# load data
+```{r}
+## Lake Erie ice cover data - NOAA
+load("LeIce.RData")
+
+## Superior - NOAA
+load("SupIce.RData")
+
+## Michigan - NOAA
+load("MicIce.RData")
+
+## Huron - NOAA
+load("HurIce.RData")
+
+## Ontario - NOAA
+load("OnIce.RData")
+```
+
+# Bayesian hierarchical model for ice cover
+smoothed hockey stick model: y = b0 + b1(x-Phi)+ (b2 - b1)*lambda*Log(1 + e^(x-phi/lambda))
+
+y = percent cover
+x = day
+b0 = y-intercept of peak cover
+b1 = rising slope
+b2 = descending slope
+phi = day of peak cover
+lambda = smoothness parameter, shape of curve
+
+estimated duration = -b0/ b2 + b0/b1
+
+```{r}
+
+BHMclimateModelIce<-"
+data {
+  int<lower=0> n; // sample size
+  real x[n]; // day
+  int<lower=1> yr;// number of years
+  int<lower=1, upper=yr> year[n]; // year index - each data point assigned to a year
+  real y[n]; // observed logit ice cover at day x
+  real lambda[yr]; // smoothness parameter, 0.1, different for each year
+  vector[yr] xlow; // first day of ice
+  vector[yr] xup; // last day of ice
+}
+parameters {
+  vector<lower=0>[yr] b1; // rising slope by year (positive)
+  vector<upper=0>[yr] b2; // descending slope by year (negative)
+  vector[yr] b0; // peak cover
+  vector[yr] logit_phi_raw; // raw phi value, fraction of range since beginning - impose hierarchical structure on this parameter
+  
+  // hyperparameters
+  real<lower=0> mu_b1; // 
+  real<lower=0> sigma_b1;   
+  
+  real<upper=0> mu_b2; // must be negative                    
+  real<lower=0> sigma_b2;    
+  
+  real mu_b0; // 
+  real<lower=0> sigma_b0;   
+  
+  real mu_phi_raw; //         
+  real<lower=0> sigma_phi_raw;
+  
+  vector<lower=0, upper=10>[yr] sigma; // noise sd indexed by year
+}
+transformed parameters {
+  vector[yr] phi_raw;; // phi_raw constrained between 0 - 1
+  vector[yr] phi; //
+  vector[n] mu;
+  vector<lower=0>[n] sig; 
+  vector[yr] delta;
+  
+  delta = b2 - b1;
+  
+  for(i in 1:yr){
+  phi_raw[i] = inv_logit(logit_phi_raw[i]);
+  phi[i] = xlow[i] + (xup[i] - xlow[i]) * phi_raw[i]; // transformed phi using x low and up
+  }
+  for (i in 1:n){
+    mu[i] = b0[year[i]] + b1[year[i]] * (x[i]-phi[year[i]]) + (delta[year[i]]) * lambda[year[i]] *
+              log1p_exp((x[i]-phi[year[i]])/lambda[year[i]]); 
+    sig[i] = sigma[year[i]]; 
+  }
+}
+model {
+  mu_b1 ~ normal(0, 5); // priors for mu
+  mu_b2 ~ normal(0, 5);
+  mu_b0 ~ normal(0, 5); 
+  mu_phi_raw ~ normal(0, 5);
+  
+  sigma_b1 ~ cauchy(0, 5); // priors for sigma
+  sigma_b2 ~ cauchy(0, 5);
+  sigma_b0 ~ cauchy(0, 5); 
+  sigma_phi_raw ~ cauchy(0, 5);
+  
+  b1 ~ normal(mu_b1, sigma_b1); 
+  b2 ~ normal(mu_b2, sigma_b2);
+  b0 ~ normal(mu_b0, sigma_b0); 
+  logit_phi_raw ~ normal(mu_phi_raw, sigma_phi_raw);
+  
+  y ~ normal(mu, sig); 
+}
+generated quantities {
+vector[yr] beg_day; // estimated beginning date
+vector[yr] end_day; // estimated end date
+vector[yr] est_dur; // estimated duration for each year
+
+for(i in 1:yr){
+beg_day[i] = phi[i] + (logit(0.1) - b0[i])/b1[i];
+end_day[i] = phi[i] + (logit(0.1) - b0[i])/b2[i];
+est_dur[i] = (logit(0.1) - b0[i]) * (1/b2[i] - 1/b1[i]);
+}
+}
+"
+
+
+IceModel<-stan_model(model_code = BHMclimateModelIce)
+save(IceModel, file="ClimateModelIce.RData")
+
+load("ClimateModelIce.RData") # load stan model
+```
+
+## Lake Erie ##
+# inital values and fitting model
+
+```{r}
+LeIce <- LeIce[complete.cases(LeIce), ] # remove rows with NAs
+
+xlow = tapply(LeIce$IceDay, LeIce$`Ice Year`, min) # first day of ice
+xup = tapply(LeIce$IceDay, LeIce$`Ice Year`, max) # first day of ice
+
+dfI <- list(
+  n = nrow(LeIce),                 
+  x = LeIce$IceDay, 
+  y = as.vector(LeIce$logitcover), # logit percent cover     
+  year = as.numeric(ordered(LeIce$`Ice Year`)),
+  yr = max(as.numeric(ordered(LeIce$`Ice Year`))),
+  xlow = xlow, # first day of ice
+  xup = xup, # last day of ice
+  lambda = 0.1 * (xup - xlow) # smoothness parameter
+)
+
+pars <- c("beg_day", "end_day", "est_dur", "b1", "b2", "phi", "b0", "sigma")
+
+# initial values
+inits<- list()
+for (i in 1:nchains) {
+  tmp = abs(runif(dfI$yr))
+  tmp2 = abs(runif(1))
+  inits[[i]] <- list(
+    b1 = tmp,
+    b2 = -tmp - abs(runif(dfI$yr)),
+    b0 = runif(dfI$yr),
+    logit_phi_raw = rnorm(dfI$yr),
+    mu_b1 = tmp2,
+    mu_b2 = -tmp2 - abs(runif(1)),
+    mu_b0 = rnorm(1),
+    mu_phi_raw = rnorm(1),
+    sigma_b1 = runif(1),
+    sigma_b2 = runif(1),
+    sigma_b0 = runif(1),
+    sigma_phi_raw = runif(1),
+    sigma = runif(dfI$yr)         
+  )
+}
+
+
+### run model ###
+fitIall2<-sampling(IceModel, data= dfI, init = inits, iter=niters, thin=nthin, chains=nchains, pars=pars)
+print(fitIall2)
+
+save(fitIall2, file="BHMIce.RData") 
+load("BHMIce.RData") # lambda = 0.1
+
+```
+## Superior ##
+# inital values and fitting model
+
+```{r}
+SupIce <- SupIce[complete.cases(SupIce), ] # remove rows with NAs
+
+xlowSup = tapply(SupIce$IceDay, SupIce$`Ice Year`, min) # first day of ice
+xupSup = tapply(SupIce$IceDay, SupIce$`Ice Year`, max) # first day of ice
+
+dfI <- list(
+  n = nrow(SupIce),                 
+  x = SupIce$IceDay, 
+  y = as.vector(SupIce$logitcover), # logit percent cover     
+  year = as.numeric(ordered(SupIce$`Ice Year`)),
+  yr = max(as.numeric(ordered(SupIce$`Ice Year`))),
+  xlow = xlowSup, # first day of ice
+  xup = xupSup, # last day of ice
+  lambda = 0.1 * (xup - xlow) # smoothness parameter
+)
+
+pars <- c("beg_day", "end_day", "est_dur", "b1", "b2", "phi", "b0", "sigma")
+
+# initial values
+inits<- list()
+for (i in 1:nchains) {
+  tmp = abs(runif(dfI$yr))
+  tmp2 = abs(runif(1))
+  inits[[i]] <- list(
+    b1 = tmp,
+    b2 = -tmp - abs(runif(dfI$yr)),
+    b0 = runif(dfI$yr),
+    logit_phi_raw = rnorm(dfI$yr),
+    mu_b1 = tmp2,
+    mu_b2 = -tmp2 - abs(runif(1)),
+    mu_b0 = rnorm(1),
+    mu_phi_raw = rnorm(1),
+    sigma_b1 = runif(1),
+    sigma_b2 = runif(1),
+    sigma_b0 = runif(1),
+    sigma_phi_raw = runif(1),
+    sigma = runif(dfI$yr)         
+  )
+}
+
+
+### run model ###
+fitIallSup<-sampling(IceModel, data= dfI, init = inits, iter=niters, thin=nthin, chains=nchains, pars=pars)
+print(fitIallSup)
+
+save(fitIallSup, file="SupBHMIce.RData") 
+load("SupBHMIce.RData") # lambda = 0.1
+```
+## Michigan ##
+# inital values and fitting model
+
+```{r}
+MicIce <- MicIce[complete.cases(MicIce), ] # remove rows with NAs
+
+xlowMic = tapply(MicIce$IceDay, MicIce$`Ice Year`, min) # first day of ice
+xupMic = tapply(MicIce$IceDay, MicIce$`Ice Year`, max) # first day of ice
+
+dfI <- list(
+  n = nrow(MicIce),                 
+  x = MicIce$IceDay, 
+  y = as.vector(MicIce$logitcover), # logit percent cover     
+  year = as.numeric(ordered(MicIce$`Ice Year`)),
+  yr = max(as.numeric(ordered(MicIce$`Ice Year`))),
+  xlow = xlowMic, # first day of ice
+  xup = xupMic, # last day of ice
+  lambda = 0.1 * (xup - xlow) # smoothness parameter
+)
+
+pars <- c("beg_day", "end_day", "est_dur", "b1", "b2", "phi", "b0", "sigma")
+
+# initial values
+inits<- list()
+for (i in 1:nchains) {
+  tmp = abs(runif(dfI$yr))
+  tmp2 = abs(runif(1))
+  inits[[i]] <- list(
+    b1 = tmp,
+    b2 = -tmp - abs(runif(dfI$yr)),
+    b0 = runif(dfI$yr),
+    logit_phi_raw = rnorm(dfI$yr),
+    mu_b1 = tmp2,
+    mu_b2 = -tmp2 - abs(runif(1)),
+    mu_b0 = rnorm(1),
+    mu_phi_raw = rnorm(1),
+    sigma_b1 = runif(1),
+    sigma_b2 = runif(1),
+    sigma_b0 = runif(1),
+    sigma_phi_raw = runif(1),
+    sigma = runif(dfI$yr)         
+  )
+}
+
+
+### run model ###
+fitIallMic<-sampling(IceModel, data= dfI, init = inits, iter=niters, thin=nthin, chains=nchains, pars=pars)
+print(fitIallMic)
+
+save(fitIallMic, file="MicBHMIce.RData") 
+load("MicBHMIce.RData") # lambda = 0.1
+```
+
+## Huron ##
+# inital values and fitting model
+
+```{r}
+HurIce <- HurIce[complete.cases(HurIce), ] # remove rows with NAs
+
+xlowHur = tapply(HurIce$IceDay, HurIce$`Ice Year`, min) # first day of ice
+xupHur = tapply(HurIce$IceDay, HurIce$`Ice Year`, max) # first day of ice
+
+dfI <- list(
+  n = nrow(HurIce),                 
+  x = HurIce$IceDay, 
+  y = as.vector(HurIce$logitcover), # logit percent cover     
+  year = as.numeric(ordered(HurIce$`Ice Year`)),
+  yr = max(as.numeric(ordered(HurIce$`Ice Year`))),
+  xlow = xlowHur, # first day of ice
+  xup = xupHur, # last day of ice
+  lambda = 0.1 * (xup - xlow) # smoothness parameter
+)
+
+pars <- c("beg_day", "end_day", "est_dur", "b1", "b2", "phi", "b0", "sigma")
+
+# initial values
+inits<- list()
+for (i in 1:nchains) {
+  tmp = abs(runif(dfI$yr))
+  tmp2 = abs(runif(1))
+  inits[[i]] <- list(
+    b1 = tmp,
+    b2 = -tmp - abs(runif(dfI$yr)),
+    b0 = runif(dfI$yr),
+    logit_phi_raw = rnorm(dfI$yr),
+    mu_b1 = tmp2,
+    mu_b2 = -tmp2 - abs(runif(1)),
+    mu_b0 = rnorm(1),
+    mu_phi_raw = rnorm(1),
+    sigma_b1 = runif(1),
+    sigma_b2 = runif(1),
+    sigma_b0 = runif(1),
+    sigma_phi_raw = runif(1),
+    sigma = runif(dfI$yr)         
+  )
+}
+
+
+### run model ###
+fitIallHur<-sampling(IceModel, data= dfI, init = inits, iter=niters, thin=nthin, chains=nchains, pars=pars)
+print(fitIallHur)
+
+save(fitIallHur, file="HurBHMIce.RData") 
+load("HurBHMIce.RData") # lambda = 0.1
+```
+## Ontario ##
+# inital values and fitting model
+
+```{r}
+OnIce <- OnIce[complete.cases(OnIce), ] # remove rows with NAs
+
+xlowOn = tapply(OnIce$IceDay, OnIce$`Ice Year`, min) # first day of ice
+xupOn = tapply(OnIce$IceDay, OnIce$`Ice Year`, max) # first day of ice
+
+dfI <- list(
+  n = nrow(OnIce),                 
+  x = OnIce$IceDay, 
+  y = as.vector(OnIce$logitcover), # logit percent cover     
+  year = as.numeric(ordered(OnIce$`Ice Year`)),
+  yr = max(as.numeric(ordered(OnIce$`Ice Year`))),
+  xlow = xlowOn, # first day of ice
+  xup = xupOn, # last day of ice
+  lambda = 0.1 * (xup - xlow) # smoothness parameter
+)
+
+pars <- c("beg_day", "end_day", "est_dur", "b1", "b2", "phi", "b0", "sigma")
+
+# initial values
+inits<- list()
+for (i in 1:nchains) {
+  tmp = abs(runif(dfI$yr))
+  tmp2 = abs(runif(1))
+  inits[[i]] <- list(
+    b1 = tmp,
+    b2 = -tmp - abs(runif(dfI$yr)),
+    b0 = runif(dfI$yr),
+    logit_phi_raw = rnorm(dfI$yr),
+    mu_b1 = tmp2,
+    mu_b2 = -tmp2 - abs(runif(1)),
+    mu_b0 = rnorm(1),
+    mu_phi_raw = rnorm(1),
+    sigma_b1 = runif(1),
+    sigma_b2 = runif(1),
+    sigma_b0 = runif(1),
+    sigma_phi_raw = runif(1),
+    sigma = runif(dfI$yr)         
+  )
+}
+
+
+### run model ###
+fitIallOn<-sampling(IceModel, data= dfI, init = inits, iter=niters, thin=nthin, chains=nchains, pars=pars)
+print(fitIallOn)
+
+save(fitIallOn, file="OnBHMIce.RData") 
+load("OnBHMIce.RData") # lambda = 0.1
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
